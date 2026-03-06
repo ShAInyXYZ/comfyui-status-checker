@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="images/logo.svg" alt="ComfyUI Status Checker" width="80" />
+  <img src="images/logo.svg?v=2" alt="ComfyUI Status Checker" width="80" />
 </p>
 
 <p align="center">
