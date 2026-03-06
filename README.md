@@ -25,6 +25,10 @@ A lightweight, always-on-top desktop status indicator for **ComfyUI** instances.
 
 ---
 
+<p align="center">
+  <img src="images/screenshot.png" alt="ComfyUI Status Checker screenshot" width="400" />
+</p>
+
 ## What It Does
 
 | Dot Color | Meaning |
@@ -58,9 +62,6 @@ A lightweight, always-on-top desktop status indicator for **ComfyUI** instances.
 - **Cross-platform** — auto-detects Linux / Windows and adjusts window hints
 - **Zero pip dependencies** — uses only Python standard library + system GTK3
 
-## Screenshot
-
-> *Screenshot coming soon — add yours to `images/screenshot.png`*
 
 ## Requirements
 
