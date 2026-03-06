@@ -845,11 +845,8 @@ class DotWindow(Gtk.Window):
 
     def _on_button_release(self, widget, event):
         if event.button == 1:
-            was_drag = self._drag_moved
             self.dragging = False
             self._drag_moved = False
-            if not was_drag:
-                self._show_endpoint_dialog()
 
     def _on_motion(self, widget, event):
         if self.dragging:
