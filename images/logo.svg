@@ -1,8 +1,8 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" width="120" height="120">
   <defs>
     <radialGradient id="glow" cx="50%" cy="50%" r="50%">
-      <stop offset="0%" stop-color="#21c55f" stop-opacity="0.25"/>
-      <stop offset="100%" stop-color="#21c55f" stop-opacity="0"/>
+      <stop offset="0%" stop-color="#3b82f6" stop-opacity="0.25"/>
+      <stop offset="100%" stop-color="#3b82f6" stop-opacity="0"/>
     </radialGradient>
   </defs>
 
@@ -10,10 +10,10 @@
   <circle cx="60" cy="60" r="56" fill="url(#glow)"/>
 
   <!-- ring -->
-  <circle cx="60" cy="60" r="44" fill="none" stroke="#21c55f" stroke-width="1.5" stroke-opacity="0.5"/>
+  <circle cx="60" cy="60" r="44" fill="none" stroke="#3b82f6" stroke-width="1.5" stroke-opacity="0.5"/>
 
   <!-- main dot -->
-  <circle cx="60" cy="60" r="36" fill="#21c55f"/>
+  <circle cx="60" cy="60" r="36" fill="#3b82f6"/>
 
   <!-- comfyui logo (scaled from 24x24 viewBox to fit inside dot) -->
   <g transform="translate(60,60) scale(2.1) translate(-12,-12)" opacity="0.7">
