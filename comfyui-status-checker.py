@@ -8,7 +8,9 @@ Drag to reposition. Right-click to quit.
 """
 
 import argparse
+import webbrowser
 import base64
+import glob
 import json
 import math
 import os
@@ -16,6 +18,7 @@ import platform
 import re
 import socket
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -67,11 +70,11 @@ def _ensure_widget_dir():
     os.makedirs(WIDGET_DIR, exist_ok=True)
 
 
-def _register_widget(name):
+def _register_widget(name, xid=None):
     _ensure_widget_dir()
     path = os.path.join(WIDGET_DIR, f"{name}.json")
     with open(path, "w") as f:
-        json.dump({"pid": os.getpid(), "name": name}, f)
+        json.dump({"pid": os.getpid(), "name": name, "xid": xid}, f)
 
 
 def _unregister_widget(name):
@@ -132,10 +135,219 @@ def _write_corner(corner_index):
         json.dump({"corner_index": corner_index, "timestamp": time.time()}, f)
 
 
+BAR_FILE = os.path.join(WIDGET_DIR, "bar.json")
+
+
+def _read_bar():
+    """SH-widgetbar state: a dict while a live bar owns the layout, None when
+    there is no bar, False when the file is mid-write (keep state, retry)."""
+    try:
+        with open(BAR_FILE) as f:
+            raw = f.read()
+    except OSError:
+        return None
+    try:
+        bar = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    if isinstance(bar, dict) and bar.get("pid") and _pid_alive(bar["pid"]):
+        return bar
+    return None
+
+
+def _dock_panel_pos(bar_rect, orientation, x, y, win, pw, ph, mx, my, mw, mh):
+    """Panel origin for a docked dot: perpendicular to the bar so it never
+    covers the neighbouring dots — below a horizontal bar, beside a vertical
+    one, flipping to the other side when the monitor edge is too close."""
+    bx, by, bw, bh = bar_rect
+    if orientation == "horizontal":
+        py = by + bh + 8
+        if py + ph > my + mh:
+            py = by - ph - 8
+        px = x + win // 2 - pw // 2
+    else:
+        px = bx + bw + 8
+        if px + pw > mx + mw:
+            px = bx - pw - 8
+        py = y
+    px = max(mx + 4, min(px, mx + mw - pw - 4))
+    py = max(my + 4, min(py, my + mh - ph - 4))
+    return px, py
+
+
+# SH-widgetbar pill surface. A docked dot paints this behind itself because
+# the bar leaves a hole under every slot (see sh-widgetbar.py).
+_BAR_FILL = (0.055, 0.051, 0.043, 0.96)
+
+
+def _xid_of(win):
+    """X11 window id of a realized Gtk.Window (None on Wayland/unrealized).
+    The bar uses it to move docked dots directly, in the same frame as itself."""
+    try:
+        import gi
+        gi.require_version("GdkX11", "3.0")
+        from gi.repository import GdkX11  # noqa: F401  (adds get_xid to windows)
+        return win.get_window().get_xid()
+    except Exception:
+        return None
+
+
 # -- defaults -------------------------------------------------------------
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8188
 POLL_SECS = 2  # fast polling for generation status
+SENSOR_SECS = 5  # local sensors change slower than the queue does
+
+
+# -- local hardware sensors -----------------------------------------------
+# ComfyUI's /system_stats reports VRAM only — no temperature, power, fan or
+# utilisation. Those come from the machine itself, so they are read locally
+# and ONLY when the monitored endpoint is this machine (see _endpoint_is_local).
+
+def _endpoint_is_local(host):
+    """True when `host` resolves to this machine.
+
+    Sensors describe local hardware; showing them next to a remote server's
+    VRAM would silently mix two machines in one panel.
+    """
+    if not host:
+        return False
+    if host in ("127.0.0.1", "::1", "localhost", "0.0.0.0"):
+        return True
+    try:
+        addrs = {ai[4][0] for ai in socket.getaddrinfo(host, None)}
+    except (socket.gaierror, UnicodeError, OSError):
+        return False
+    if addrs & {"127.0.0.1", "::1"}:
+        return True
+    try:
+        local = {ai[4][0] for ai in socket.getaddrinfo(socket.gethostname(), None)}
+    except (socket.gaierror, UnicodeError, OSError):
+        local = set()
+    return bool(addrs & local)
+
+
+def _run(cmd, timeout=4):
+    """Run a command, returning stdout or None. Never raises."""
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return p.stdout if p.returncode == 0 else None
+
+
+_NVIDIA_SMI_FIELDS = (
+    "index,temperature.gpu,utilization.gpu,power.draw,power.limit,fan.speed"
+)
+
+
+def read_gpu_sensors():
+    """Per-GPU telemetry from nvidia-smi, keyed by device index.
+
+    Returns {} when nvidia-smi is absent or fails — the panel simply omits
+    the rows rather than showing zeros.
+    """
+    out = _run(["nvidia-smi", f"--query-gpu={_NVIDIA_SMI_FIELDS}",
+                "--format=csv,noheader,nounits"])
+    if not out:
+        return {}
+
+    def num(tok):
+        tok = tok.strip()
+        try:
+            return float(tok)
+        except ValueError:
+            return None  # "[N/A]" on cards without that sensor
+
+    sensors = {}
+    for line in out.strip().splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 6:
+            continue
+        idx = num(parts[0])
+        if idx is None:
+            continue
+        sensors[int(idx)] = {
+            "temp": num(parts[1]),
+            "util": num(parts[2]),
+            "power": num(parts[3]),
+            "power_limit": num(parts[4]),
+            "fan": num(parts[5]),
+        }
+    return sensors
+
+
+def _find_cpu_temp_input():
+    """Locate a CPU package temperature file under hwmon, or None.
+
+    Prefers the known CPU drivers, then any sensor labelled Package/Tdie/Tctl.
+    """
+    prefer = ("k10temp", "zenpower", "coretemp")
+    try:
+        hwmons = sorted(glob.glob("/sys/class/hwmon/hwmon*"))
+    except OSError:
+        return None
+
+    labelled = []
+    for h in hwmons:
+        try:
+            with open(os.path.join(h, "name")) as f:
+                name = f.read().strip()
+        except OSError:
+            continue
+        for inp in sorted(glob.glob(os.path.join(h, "temp*_input"))):
+            label = ""
+            try:
+                with open(inp.replace("_input", "_label")) as f:
+                    label = f.read().strip()
+            except OSError:
+                pass
+            if name in prefer:
+                # Tdie/Tctl/Package is the die reading; fall back to first input
+                if label in ("Tdie", "Tctl", "Package id 0") or not label:
+                    return inp
+                labelled.append(inp)
+            elif label.startswith(("Package", "Tdie", "Tctl")):
+                labelled.append(inp)
+    return labelled[0] if labelled else None
+
+
+class _CpuUtil:
+    """CPU utilisation from successive /proc/stat deltas."""
+
+    def __init__(self):
+        self._prev = None
+
+    def read(self):
+        try:
+            with open("/proc/stat") as f:
+                parts = f.readline().split()
+        except OSError:
+            return None
+        if len(parts) < 5 or parts[0] != "cpu":
+            return None
+        vals = [float(v) for v in parts[1:]]
+        idle = vals[3] + (vals[4] if len(vals) > 4 else 0.0)
+        total = sum(vals)
+        prev, self._prev = self._prev, (idle, total)
+        if prev is None:
+            return None  # need two samples for a delta
+        d_idle, d_total = idle - prev[0], total - prev[1]
+        if d_total <= 0:
+            return None
+        return max(0.0, min(100.0, (1.0 - d_idle / d_total) * 100.0))
+
+
+def read_cpu_sensors(temp_input, util_reader):
+    """CPU temperature (°C) and utilisation (%), each None when unavailable."""
+    temp = None
+    if temp_input:
+        try:
+            with open(temp_input) as f:
+                temp = int(f.read().strip()) / 1000.0
+        except (OSError, ValueError):
+            temp = None
+    return {"temp": temp, "util": util_reader.read()}
 
 # -- design tokens --------------------------------------------------------
 BG_PANEL = (0.08, 0.08, 0.08)
@@ -147,7 +359,9 @@ BORDER_CLR = (0.17, 0.17, 0.17)
 DOT_RADIUS = 14
 RING_RADIUS = 18
 GLOW_RADIUS = 22
-WIN_SIZE = GLOW_RADIUS * 2 + 8
+WIN_SIZE = 44        # avatar + bubble fit in this; must match DOT in sh-widgetbar.py
+AVATAR_RADIUS = 17   # the brand disc
+BUBBLE_RADIUS = 5    # status bubble, top-right, chat-app style
 
 # state → color
 STATE_COLORS = {
@@ -280,19 +494,22 @@ class _ComfyWS:
 
 
 # -- ComfyUI logo SVG path (viewBox 0 0 24 24) ---------------------------
+COMFY_BRAND = (0.129, 0.098, 0.153)    # comfy.org plum #211927
+COMFY_LIME = (0.949, 1.0, 0.349)       # comfy.org lime #F2FF59
 COMFYUI_LOGO_PATH = (
-    "M5.485 23.76c-.568 0-1.026-.207-1.325-.598-.307-.402-.387-.964-.22"
-    "-1.54l.672-2.315a.605.605 0 00-.1-.536.622.622 0 00-.494-.243H2.085"
-    "c-.568 0-1.026-.207-1.325-.598-.307-.403-.387-.964-.22-1.54l2.31"
-    "-7.917.255-.87c.343-1.18 1.592-2.14 2.786-2.14h2.313c.276 0 .519"
-    "-.18.595-.442l.764-2.633C9.906 1.208 11.155.249 12.35.249l4.945-.008"
-    "h3.62c.568 0 1.027.206 1.325.597.307.402.387.964.22 1.54l-1.035"
-    " 3.566c-.343 1.178-1.593 2.137-2.787 2.137l-4.956.01H11.37a.618.618"
-    " 0 00-.594.441l-1.928 6.604a.605.605 0 00.1.537c.118.153.3.243.495"
-    ".243l3.275-.006h3.61c.568 0 1.026.206 1.325.598.307.402.387.964.22"
-    " 1.54l-1.036 3.565c-.342 1.179-1.592 2.138-2.786 2.138l-4.957.01"
-    "h-3.61z"
-)
+    "M31.0126 30.4797C31.0576 30.3275 31.0822 30.1671 31.0822 29.9985C31.0822 29.0649 30.3294 2"
+    "8.3081 29.4006 28.3081H21.8643C21.4593 28.3122 21.1279 27.9832 21.1279 27.576C21.1279 27.5"
+    "019 21.1401 27.432 21.1565 27.3662L23.1858 20.259C23.2717 19.9465 23.5581 19.7161 23.8936 "
+    "19.7161L31.4586 19.7079C33.0542 19.7079 34.4003 18.6262 34.8053 17.1497L35.9427 13.1889C35"
+    ".9795 13.0491 36 12.8969 36 12.7447C36 11.8152 35.2513 11.0625 34.3266 11.0625H25.1742C23."
+    "5868 11.0625 22.2448 12.136 21.8316 13.5961L21.0624 16.2983C20.9724 16.6068 20.6901 16.833"
+    " 20.3546 16.833H18.1575C16.5823 16.833 15.2526 17.8859 14.8271 19.3295L12.0614 29.0402C12."
+    "0205 29.1841 12 29.3404 12 29.4967C12 30.4304 12.7528 31.1871 13.6816 31.1871H15.8418C16.2"
+    "468 31.1871 16.5782 31.5162 16.5782 31.9275C16.5782 31.9974 16.5701 32.0673 16.5496 32.133"
+    "1L15.7845 34.8107C15.7477 34.9546 15.7232 35.1027 15.7232 35.2549C15.7232 36.1844 16.4719 "
+    "36.937 17.3965 36.937L26.553 36.9288C28.1446 36.9288 29.4865 35.8512 29.8957 34.3829L31.00"
+    "85 30.4838L31.0126 30.4797Z"
+)  # comfy.org favicon mark (48-box)
 
 
 def _normalize_arc_flags(d):
@@ -543,6 +760,66 @@ def fmt_pct(used, total):
     return f"{used / total * 100:.0f}%"
 
 
+def _short_gpu_name(name):
+    """Drop vendor/brand noise that repeats on every card."""
+    for prefix in ("NVIDIA GeForce ", "NVIDIA ", "AMD Radeon ", "AMD ", "Intel(R) "):
+        if name.startswith(prefix):
+            return name[len(prefix):]
+    return name
+
+
+def fmt_temp(c):
+    """Format a °C reading."""
+    if c is None:
+        return "—"
+    return f"{c:.0f}°C"
+
+
+def _device_info(dev, fallback_index=0):
+    """Normalise one entry of /system_stats devices[] into what the panel draws.
+
+    Everything is derived from the response — the allocator suffix, the
+    device index and the short name are only *parsed* if present, never
+    assumed. Any device the server reports (cuda, cpu, mps, xpu, ...)
+    survives this untouched.
+    """
+    raw_name = (dev.get("name") or "").strip()
+
+    # ComfyUI formats names as "cuda:0 NVIDIA GeForce RTX 3090 : cudaMallocAsync".
+    # Split the allocator suffix off the end if the " : " separator is there.
+    if " : " in raw_name:
+        name_part, allocator = (s.strip() for s in raw_name.rsplit(" : ", 1))
+    else:
+        name_part, allocator = raw_name, ""
+
+    # Lead token is the torch device string ("cuda:0") when it looks like one.
+    label, short_name = name_part, name_part
+    head, _, tail = name_part.partition(" ")
+    if ":" in head and tail:
+        label, short_name = head, tail.strip()
+
+    index = dev.get("index")
+    if index is None:
+        index = fallback_index
+
+    vram_total = dev.get("vram_total") or 0
+    vram_free = dev.get("vram_free") or 0
+    torch_total = dev.get("torch_vram_total") or 0
+    torch_free = dev.get("torch_vram_free") or 0
+
+    return {
+        "label": label or f"device {index}",       # "cuda:0"
+        "name": short_name or raw_name or "—",     # "NVIDIA GeForce RTX 3090"
+        "type": dev.get("type") or "",
+        "index": index,
+        "allocator": allocator,
+        "vram_total": vram_total,
+        "vram_used": max(0, vram_total - vram_free),
+        "torch_vram_total": torch_total,
+        "torch_vram_used": max(0, torch_total - torch_free),
+    }
+
+
 class DotWindow(Gtk.Window):
     """The small circular always-on-top dot."""
 
@@ -607,9 +884,24 @@ class DotWindow(Gtk.Window):
         self._progress_toast = None
         self._ws_progress = (0, 0)  # (step, total) from websocket
 
+        # local sensor state — only meaningful when ComfyUI runs on this machine
+        self._sensors_local = _endpoint_is_local(host)
+        self._cpu_temp_input = _find_cpu_temp_input() if self._sensors_local else None
+        self._cpu_util = _CpuUtil()
+        self._gpu_sensor_cache = {}
+        self._gpu_sensor_ts = 0.0
+        self._cpu_sensor_cache = None
+        self._cpu_sensor_ts = 0.0
+
         # widget coordination
         _register_widget(WIDGET_NAME)
+        self.connect("realize", lambda w: _register_widget(WIDGET_NAME, _xid_of(w)))
         self._last_corner_ts = 0  # track corner file changes
+        self._docked = False
+        self._last_bar_ts = 0
+        self._bar_rect = None
+        self._bar_target = None
+        self._bar_orientation = "horizontal"
         self.connect("destroy", lambda w: _unregister_widget(WIDGET_NAME))
 
         # websocket for generation progress
@@ -620,7 +912,7 @@ class DotWindow(Gtk.Window):
         # pulse timer (20fps)
         GLib.timeout_add(50, self._tick_pulse)
         # watch shared corner file (5 checks/sec)
-        GLib.timeout_add(200, self._watch_corner)
+        GLib.timeout_add(50, self._watch_corner)   # 50 ms: tracks a bar drag smoothly
         # poll thread
         threading.Thread(target=self._poll_loop, daemon=True).start()
 
@@ -630,11 +922,8 @@ class DotWindow(Gtk.Window):
             "state": "offline",
             "running": 0,
             "pending": 0,
-            "gpu_name": "—",
-            "vram_total": 0,
-            "vram_used": 0,
-            "torch_vram_total": 0,
-            "torch_vram_used": 0,
+            "devices": [],
+            "cpu": {"temp": None, "util": None},
             "ram_total": 0,
             "ram_free": 0,
             "comfyui_version": "—",
@@ -647,57 +936,59 @@ class DotWindow(Gtk.Window):
     # -- drawing ----------------------------------------------------------
 
     def _on_draw(self, widget, cr):
-        cr.set_operator(0)  # CLEAR
-        cr.paint()
-        cr.set_operator(2)  # OVER
-
-        cx = WIN_SIZE / 2
-        cy = WIN_SIZE / 2
-        r, g, b = self.color
+        cr.set_operator(0); cr.paint(); cr.set_operator(2)   # clear to transparent
+        if self._docked:   # the bar has a hole here: paint its surface under us
+            cr.set_source_rgba(*_BAR_FILL)
+            cr.paint()
+        cx = cy = WIN_SIZE / 2
+        R = AVATAR_RADIUS
+        sr, sg, sb = self.color          # status colour lives only in the bubble
         state = self.data["state"]
 
-        # glow — faster pulse when generating
-        speed = 2.0 if state == "generating" else 1.0
-        pulse = 0.3 + 0.7 * (0.5 + 0.5 * math.sin(self.pulse_phase * speed))
-        cr.set_source_rgba(r, g, b, 0.15 * pulse)
-        cr.arc(cx, cy, GLOW_RADIUS, 0, 2 * math.pi)
-        cr.fill()
-
-        # ring
-        cr.set_source_rgba(r, g, b, 0.5)
-        cr.set_line_width(1.5)
-        cr.arc(cx, cy, RING_RADIUS, 0, 2 * math.pi)
-        cr.stroke()
-
-        # main dot
-        cr.set_source_rgb(r, g, b)
-        cr.arc(cx, cy, DOT_RADIUS, 0, 2 * math.pi)
-        cr.fill()
-
-        # ComfyUI logo inside the dot
-        cr.save()
-        cr.arc(cx, cy, DOT_RADIUS, 0, 2 * math.pi)
-        cr.clip()
-        logo_size = DOT_RADIUS * 1.4
-        cr.set_source_rgba(0.05, 0.05, 0.05, 0.7)
-        draw_svg_logo(cr, COMFYUI_LOGO_PATH, cx, cy, logo_size)
-        cr.fill()
-        cr.restore()
-
-        # progress arc overlay when generating
-        if state == "generating":
-            # spinning arc to indicate activity
-            angle = self.pulse_phase * 3.0
-            cr.set_source_rgba(1, 1, 1, 0.25)
-            cr.set_line_width(2.5)
-            cr.arc(cx, cy, DOT_RADIUS - 3, angle, angle + math.pi * 0.6)
+        # Something wrong: a slow breathing ring around the avatar, nothing else.
+        if state == "error":
+            pulse = 0.5 + 0.5 * math.sin(self.pulse_phase)
+            cr.set_source_rgba(sr, sg, sb, 0.10 + 0.25 * pulse)
+            cr.set_line_width(1)
+            cr.arc(cx, cy, R + 3, 0, 2 * math.pi)
             cr.stroke()
 
-        # specular highlight
-        cr.set_source_rgba(1, 1, 1, 0.12)
-        cr.arc(cx - 3, cy - 3, DOT_RADIUS * 0.35, 0, 2 * math.pi)
+        # brand disc, with a faint hairline so dark brands still read on the pill
+        cr.set_source_rgb(*COMFY_BRAND)
+        cr.arc(cx, cy, R, 0, 2 * math.pi)
         cr.fill()
+        cr.set_source_rgba(0.937, 0.925, 0.902, 0.14)
+        cr.set_line_width(1)
+        cr.arc(cx, cy, R - 0.5, 0, 2 * math.pi)
+        cr.stroke()
 
+        # the logo, in its brand foreground
+        cr.save()
+        cr.arc(cx, cy, R, 0, 2 * math.pi)
+        cr.clip()
+        cr.set_source_rgb(*COMFY_LIME)
+        draw_svg_logo(cr, COMFYUI_LOGO_PATH, cx, cy, R * 2 * 0.8, 48)
+        cr.fill()
+        cr.restore()
+        if state == "generating":       # spinning arc just inside the disc edge
+            angle = self.pulse_phase * 3.0
+            cr.set_source_rgba(*COMFY_LIME, 0.9)
+            cr.set_line_width(2)
+            cr.arc(cx, cy, R - 2, angle, angle + math.pi * 0.6)
+            cr.stroke()
+
+        # status bubble, top-right, cut out of the disc like a chat presence dot
+        bx, by = cx + R * 0.70, cy - R * 0.70
+        if self._docked:
+            cr.set_source_rgba(*_BAR_FILL)
+        else:
+            cr.set_operator(0)           # free-floating: punch a transparent gap
+        cr.arc(bx, by, BUBBLE_RADIUS + 2, 0, 2 * math.pi)
+        cr.fill()
+        cr.set_operator(2)
+        cr.set_source_rgb(sr, sg, sb)
+        cr.arc(bx, by, BUBBLE_RADIUS, 0, 2 * math.pi)
+        cr.fill()
         return False
 
     def _tick_pulse(self):
@@ -712,6 +1003,31 @@ class DotWindow(Gtk.Window):
             data = self._fetch()
             GLib.idle_add(self._apply_data, data)
             time.sleep(POLL_SECS)
+
+    # -- local sensors ----------------------------------------------------
+
+    def _read_gpu_sensors(self):
+        """nvidia-smi telemetry, throttled and cached. {} when not applicable."""
+        if not self._sensors_local:
+            return {}
+        now = time.monotonic()
+        if now - self._gpu_sensor_ts >= SENSOR_SECS:
+            self._gpu_sensor_cache = read_gpu_sensors()
+            self._gpu_sensor_ts = now
+        return self._gpu_sensor_cache
+
+    def _read_cpu(self):
+        """CPU temp + utilisation, throttled and cached."""
+        empty = {"temp": None, "util": None}
+        if not self._sensors_local:
+            return empty
+        now = time.monotonic()
+        if now - self._cpu_sensor_ts >= SENSOR_SECS:
+            self._cpu_sensor_cache = read_cpu_sensors(
+                self._cpu_temp_input, self._cpu_util
+            )
+            self._cpu_sensor_ts = now
+        return self._cpu_sensor_cache or empty
 
     def _fetch(self):
         data = self._empty_data()
@@ -753,14 +1069,19 @@ class DotWindow(Gtk.Window):
             data["ram_total"] = system.get("ram_total", 0)
             data["ram_free"] = system.get("ram_free", 0)
 
-            devices = sys_data.get("devices", [])
-            if devices:
-                dev = devices[0]
-                data["gpu_name"] = dev.get("name", "—").split(" : ")[0]
-                data["vram_total"] = dev.get("vram_total", 0)
-                data["vram_used"] = dev.get("vram_total", 0) - dev.get("vram_free", 0)
-                data["torch_vram_total"] = dev.get("torch_vram_total", 0)
-                data["torch_vram_used"] = dev.get("torch_vram_total", 0) - dev.get("torch_vram_free", 0)
+            # every device the server reports — count, order and naming
+            # all come from the response, nothing assumed
+            data["cpu"] = self._read_cpu()
+            devices = [
+                _device_info(dev, i)
+                for i, dev in enumerate(sys_data.get("devices", []) or [])
+            ]
+
+            # local telemetry (temp / power / util / fan) merged in by index
+            gpu_sensors = self._read_gpu_sensors()
+            for dev in devices:
+                dev.update(gpu_sensors.get(dev["index"], {}))
+            data["devices"] = devices
 
         except (URLError, KeyError, json.JSONDecodeError, OSError, ConnectionError):
             data["state"] = "offline"
@@ -841,7 +1162,35 @@ class DotWindow(Gtk.Window):
             self._drag_offset_x = int(event.x_root) - wx
             self._drag_offset_y = int(event.y_root) - wy
         elif event.button == 3:
-            self.destroy()
+            self._show_menu(event)
+
+    def _show_menu(self, event):
+        """Refresh, open the page, and Quit last behind a separator."""
+        self._close_panel()
+        menu = Gtk.Menu()
+        menu.attach_to_widget(self, None)
+        self._menu = menu
+
+        def add(label, cb):
+            it = Gtk.MenuItem(label=label)
+            it.connect("activate", lambda *_: cb())
+            menu.append(it)
+
+        add("Refresh now", self._refresh_now)
+        add("Open ComfyUI", lambda: webbrowser.open(self.base_url))
+        menu.append(Gtk.SeparatorMenuItem())
+        add("Quit ComfyUI widget", self.destroy)
+        menu.show_all()
+        menu.popup_at_pointer(event)
+
+    def _refresh_now(self):
+        def work():
+            try:
+                data = self._fetch()
+            except Exception:
+                return
+            GLib.idle_add(self._apply_data, data)
+        threading.Thread(target=work, daemon=True).start()
 
     def _on_button_release(self, widget, event):
         if event.button == 1:
@@ -849,7 +1198,7 @@ class DotWindow(Gtk.Window):
             self._drag_moved = False
 
     def _on_motion(self, widget, event):
-        if self.dragging:
+        if self.dragging and not self._docked:
             self._drag_moved = True
             self.move(
                 int(event.x_root) - self._drag_offset_x,
@@ -858,7 +1207,8 @@ class DotWindow(Gtk.Window):
 
     def _on_key_press(self, widget, event):
         if event.keyval == Gdk.KEY_grave:  # ~ / ` key
-            self._cycle_corner()
+            if not self._docked:
+                self._cycle_corner()
             return True
         return False
 
@@ -873,6 +1223,32 @@ class DotWindow(Gtk.Window):
 
     def _watch_corner(self):
         """Poll shared corner file for changes from other widgets."""
+        # SH-widgetbar takes precedence: while a live bar publishes a slot
+        # for us, sit in it and ignore corner cycling.
+        bar = _read_bar()
+        if bar is False:            # bar.json mid-write (bar being dragged): hold
+            return True
+        slot = (bar or {}).get("slots", {}).get(WIDGET_NAME)
+        if slot:
+            target = (int(slot[0]) - WIN_SIZE // 2, int(slot[1]) - WIN_SIZE // 2)
+            if target != self._bar_target:
+                self._bar_target = target
+                self._close_panel()
+                self.move(*target)
+                try:
+                    self.get_window().raise_()  # dots sit on top of the pill
+                except Exception:
+                    pass
+            self._bar_rect = bar.get("rect")
+            self._bar_orientation = bar.get("orientation", "horizontal")
+            self._docked = True
+            # Swallow corner changes while docked: the bar decides where we
+            # are, and leaving it later must leave us where we stand.
+            self._last_corner_ts = max(self._last_corner_ts,
+                                       _read_corner()["timestamp"])
+            return True
+        self._docked = False
+        self._bar_target = None
         corner = _read_corner()
         if corner["timestamp"] > self._last_corner_ts:
             self._last_corner_ts = corner["timestamp"]
@@ -970,6 +1346,15 @@ class DotWindow(Gtk.Window):
                 self.host = new_host
                 self.port = new_port
                 self.base_url = f"http://{self.host}:{self.port}"
+                # sensors describe local hardware — re-evaluate for the new host
+                self._sensors_local = _endpoint_is_local(self.host)
+                self._cpu_temp_input = (
+                    _find_cpu_temp_input() if self._sensors_local else None
+                )
+                self._gpu_sensor_cache = {}
+                self._gpu_sensor_ts = 0.0
+                self._cpu_sensor_cache = None
+                self._cpu_sensor_ts = 0.0
                 # reset to offline until next poll confirms connection
                 self.data = self._empty_data()
                 self._prev_state = None
@@ -994,15 +1379,20 @@ class DotWindow(Gtk.Window):
         self.panel = PanelWindow(self)
         self.panel.update_data(self.data, self.base_url)
         x, y = self.get_position()
-        px = x + WIN_SIZE + 6
-        py = y
         screen = self.get_screen()
-        sw = screen.get_width()
+        sw, sh = screen.get_width(), screen.get_height()
         self.panel.show_all()
         pw = self.panel.get_allocated_width()
-        if px + pw > sw:
-            px = x - pw - 6
-        self.panel.move(px, max(py, 4))
+        ph = self.panel.get_allocated_height()
+        if self._docked and self._bar_rect:
+            px, py = _dock_panel_pos(self._bar_rect, self._bar_orientation, x, y,
+                                     WIN_SIZE, pw, ph, 0, 0, sw, sh)
+        else:
+            px = x + WIN_SIZE + 6
+            py = max(y, 4)
+            if px + pw > sw:
+                px = x - pw - 6
+        self.panel.move(px, py)
 
     def _close_panel(self):
         if self.panel and self.panel.get_visible():
@@ -1146,10 +1536,10 @@ class PanelWindow(Gtk.Window):
         self.box.set_margin_bottom(1)
 
         self.inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        self.inner.set_margin_start(16)
-        self.inner.set_margin_end(16)
-        self.inner.set_margin_top(12)
-        self.inner.set_margin_bottom(12)
+        self.inner.set_margin_start(14)
+        self.inner.set_margin_end(14)
+        self.inner.set_margin_top(10)
+        self.inner.set_margin_bottom(10)
         self.box.pack_start(self.inner, True, True, 0)
         self.add(self.box)
 
@@ -1157,12 +1547,13 @@ class PanelWindow(Gtk.Window):
 
     def _apply_css(self):
         css = b"""
-        window { background-color: rgba(20,20,20,0.96); border: 1px solid #2a2a2a; }
+        window { background-color: rgba(18,18,18,0.99); border: 1px solid #2a2a2a; }
         .panel-title { font-family: "Teko"; font-size: 18px; font-weight: bold; color: #F5F5F0; }
         .panel-section { font-family: "JetBrains Mono"; font-size: 8px; font-weight: bold; color: #8A8A80; }
-        .row { background-color: rgba(26,26,26,0.9); border-radius: 4px; padding: 6px 10px; margin: 1px 0; }
-        .row-label { font-family: "JetBrains Mono"; font-size: 12px; color: #8A8A80; }
-        .row-value { font-family: "JetBrains Mono"; font-size: 12px; color: #F5F5F0; }
+        .row { background-color: rgba(26,26,26,0.9); border-radius: 4px; padding: 4px 10px; margin: 1px 0; }
+        .row-label { font-family: "JetBrains Mono"; font-size: 11px; color: #8A8A80; }
+        .row-value { font-family: "JetBrains Mono"; font-size: 11px; color: #F5F5F0; }
+        .metric-label { font-family: "JetBrains Mono"; font-size: 7px; font-weight: bold; color: #6A6A64; }
         .footer { font-family: "Inter"; font-size: 8px; color: #5a5a54; }
         .sep { background-color: #2a2a2a; min-height: 1px; }
         .bar-bg { background-color: #1a1a1a; border-radius: 2px; min-height: 6px; }
@@ -1176,7 +1567,7 @@ class PanelWindow(Gtk.Window):
 
     def _on_draw_bg(self, widget, cr):
         alloc = self.get_allocation()
-        cr.set_source_rgba(0.08, 0.08, 0.08, 0.96)
+        cr.set_source_rgba(0.07, 0.07, 0.07, 0.99)
         cr.rectangle(0, 0, alloc.width, alloc.height)
         cr.fill()
         cr.set_source_rgba(0.17, 0.17, 0.17, 1)
@@ -1244,44 +1635,77 @@ class PanelWindow(Gtk.Window):
 
         self._add_sep()
 
-        # -- GPU / VRAM section -----------------------------------------------
-        self._add_section("GPU")
-        self._add_row("Device", data["gpu_name"])
+        # -- device sections — one per device the server reports ---------------
+        devices = data.get("devices") or []
+        for i, dev in enumerate(devices):
+            if i:
+                self._add_sep()
 
-        vram_total = data["vram_total"]
-        vram_used = data["vram_used"]
-        if vram_total:
-            self._add_bar_row(
-                "VRAM",
-                f"{fmt_bytes(vram_used)} / {fmt_bytes(vram_total)}",
-                vram_used / vram_total,
-            )
+            # header names the device only when there is more than one
+            if len(devices) > 1:
+                self._add_section(f"{dev['label'].upper()}  ·  {_short_gpu_name(dev['name'])}")
+            else:
+                self._add_section(f"GPU  ·  {_short_gpu_name(dev['name'])}")
 
-        torch_total = data["torch_vram_total"]
-        torch_used = data["torch_vram_used"]
-        if torch_total:
-            self._add_bar_row(
-                "Torch VRAM",
-                f"{fmt_bytes(torch_used)} / {fmt_bytes(torch_total)}",
-                torch_used / torch_total,
-            )
+            vram_total = dev["vram_total"]
+            vram_used = dev["vram_used"]
+            if vram_total:
+                self._add_bar_row(
+                    "VRAM",
+                    f"{fmt_bytes(vram_used)} / {fmt_bytes(vram_total)}"
+                    f"  ({fmt_pct(vram_used, vram_total)})",
+                    vram_used / vram_total,
+                )
 
+            torch_total = dev["torch_vram_total"]
+            torch_used = dev["torch_vram_used"]
+            if torch_total:
+                self._add_bar_row(
+                    "Torch VRAM",
+                    f"{fmt_bytes(torch_used)} / {fmt_bytes(torch_total)}",
+                    torch_used / torch_total,
+                )
+            # when the allocator hides torch's pool (cudaMallocAsync) the row is
+            # simply omitted — the allocator is named in the footer instead
+
+            # local telemetry — one compact row, each cell only when reported
+            self._add_metrics_row([
+                ("LOAD", f"{dev['util']:.0f}%") if dev.get("util") is not None else None,
+                ("TEMP", fmt_temp(dev["temp"])) if dev.get("temp") is not None else None,
+                ("POWER", f"{dev['power']:.0f}W") if dev.get("power") is not None else None,
+                ("FAN", f"{dev['fan']:.0f}%") if dev.get("fan") is not None else None,
+            ])
+
+        # -- CPU section — only when local sensors reported ---------------------
+        cpu = data.get("cpu") or {}
         ram_total = data["ram_total"]
         ram_used = ram_total - data["ram_free"]
-        if ram_total:
-            self._add_bar_row(
-                "System RAM",
-                f"{fmt_bytes(ram_used)} / {fmt_bytes(ram_total)}",
-                ram_used / ram_total,
-            )
+        if cpu.get("temp") is not None or cpu.get("util") is not None:
+            self._add_sep()
+            self._add_section("CPU")
+            self._add_metrics_row([
+                ("LOAD", f"{cpu['util']:.0f}%") if cpu.get("util") is not None else None,
+                ("TEMP", fmt_temp(cpu["temp"])) if cpu.get("temp") is not None else None,
+                ("RAM", f"{fmt_pct(ram_used, ram_total)}") if ram_total else None,
+            ])
 
         self._add_sep()
 
         # -- system info ------------------------------------------------------
         self._add_section("SYSTEM")
-        self._add_row("ComfyUI", data["comfyui_version"])
-        self._add_row("PyTorch", data["pytorch_version"])
-        self._add_row("Python", data["python_version"])
+
+        if ram_total:
+            self._add_bar_row(
+                "RAM",
+                f"{fmt_bytes(ram_used)} / {fmt_bytes(ram_total)}",
+                ram_used / ram_total,
+            )
+
+        self._add_metrics_row([
+            ("COMFYUI", data["comfyui_version"]),
+            ("TORCH", data["pytorch_version"].split("+")[0]),
+            ("PYTHON", data["python_version"]),
+        ])
         self._add_endpoint_row(base_url)
 
         self._add_footer(data)
@@ -1293,7 +1717,7 @@ class PanelWindow(Gtk.Window):
         lbl = Gtk.Label(label=text)
         lbl.get_style_context().add_class("panel-section")
         lbl.set_halign(Gtk.Align.START)
-        self.inner.pack_start(lbl, False, False, 4)
+        self.inner.pack_start(lbl, False, False, 2)
 
     def _add_sep(self):
         sep = Gtk.Separator()
@@ -1325,6 +1749,33 @@ class PanelWindow(Gtk.Window):
 
         self.inner.pack_start(row, False, False, 0)
 
+    def _add_metrics_row(self, metrics):
+        """Several short readings on one line: [(label, value), ...].
+
+        Telemetry values are 3-6 characters, so a full-width row each wastes
+        vertical space. Spread them evenly instead.
+        """
+        metrics = [m for m in metrics if m]
+        if not metrics:
+            return
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        row.get_style_context().add_class("row")
+        row.set_homogeneous(True)
+
+        for label, value in metrics:
+            cell = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+            l = Gtk.Label(label=label)
+            l.get_style_context().add_class("metric-label")
+            l.set_xalign(0)
+            v = Gtk.Label(label=value)
+            v.get_style_context().add_class("row-value")
+            v.set_xalign(0)
+            cell.pack_start(l, False, False, 0)
+            cell.pack_start(v, False, False, 0)
+            row.pack_start(cell, True, True, 0)
+
+        self.inner.pack_start(row, False, False, 0)
+
     def _add_endpoint_row(self, url):
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         row.get_style_context().add_class("row")
@@ -1346,27 +1797,27 @@ class PanelWindow(Gtk.Window):
         self.inner.pack_start(row, False, False, 0)
 
     def _add_bar_row(self, label, value_text, fraction):
-        row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        # one line: label | meter | value
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         row.get_style_context().add_class("row")
 
-        top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         l = Gtk.Label(label=label)
         l.get_style_context().add_class("row-label")
-        l.set_halign(Gtk.Align.START)
-        top.pack_start(l, True, True, 0)
+        l.set_xalign(0)
+        l.set_size_request(84, -1)
+        row.pack_start(l, False, False, 0)
+
+        bar = Gtk.DrawingArea()
+        bar.set_size_request(100, 10)
+        bar.set_valign(Gtk.Align.CENTER)
+        frac = max(0.0, min(1.0, fraction))
+        bar.connect("draw", self._draw_bar, frac)
+        row.pack_start(bar, True, True, 0)
 
         v = Gtk.Label(label=value_text)
         v.get_style_context().add_class("row-value")
-        v.set_halign(Gtk.Align.END)
-        top.pack_end(v, False, False, 0)
-        row.pack_start(top, False, False, 0)
-
-        # progress bar via DrawingArea
-        bar = Gtk.DrawingArea()
-        bar.set_size_request(-1, 6)
-        frac = max(0.0, min(1.0, fraction))
-        bar.connect("draw", self._draw_bar, frac)
-        row.pack_start(bar, False, False, 0)
+        v.set_xalign(1)
+        row.pack_end(v, False, False, 0)
 
         self.inner.pack_start(row, False, False, 0)
 
@@ -1374,22 +1825,26 @@ class PanelWindow(Gtk.Window):
     def _draw_bar(widget, cr, fraction):
         alloc = widget.get_allocation()
         w, h = alloc.width, alloc.height
+        r = h / 2
 
-        # background
-        cr.set_source_rgb(0.12, 0.12, 0.12)
-        cr.rectangle(0, 0, w, h)
+        def pill(width):
+            cr.new_path()
+            cr.arc(r, r, r, math.pi / 2, 3 * math.pi / 2)
+            cr.arc(max(r, width - r), r, r, 3 * math.pi / 2, math.pi / 2)
+            cr.close_path()
+
+        cr.set_source_rgb(0.118, 0.106, 0.090)   # track: surface 3
+        pill(w)
         cr.fill()
-
-        # filled portion — color based on usage
         if fraction < 0.6:
-            cr.set_source_rgb(0.13, 0.77, 0.37)  # green
+            cr.set_source_rgb(0.427, 0.643, 0.416)
         elif fraction < 0.85:
-            cr.set_source_rgb(0.92, 0.70, 0.03)  # yellow
+            cr.set_source_rgb(0.851, 0.647, 0.239)
         else:
-            cr.set_source_rgb(0.94, 0.27, 0.27)  # red
-
-        cr.rectangle(0, 0, w * fraction, h)
-        cr.fill()
+            cr.set_source_rgb(0.812, 0.325, 0.278)
+        if fraction > 0:
+            pill(max(h, w * fraction))
+            cr.fill()
         return False
 
     def _add_footer(self, data):
@@ -1397,7 +1852,7 @@ class PanelWindow(Gtk.Window):
         check_str = ""
         if data["last_check"]:
             check_str = f"Last checked: {data['last_check'].strftime('%H:%M:%S UTC')}"
-        footer = Gtk.Label(label=f"{check_str}   ·   Right-click dot to quit")
+        footer = Gtk.Label(label=f"{check_str}   ·   Right-click: menu")
         footer.get_style_context().add_class("footer")
         footer.set_halign(Gtk.Align.START)
         self.inner.pack_start(footer, False, False, 0)

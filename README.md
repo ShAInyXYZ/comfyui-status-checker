@@ -1,3 +1,5 @@
+> **Moved.** This widget now lives in **[NoClickDock](https://github.com/ShAInyXYZ/NoClickDock)** — one repository for the whole NCD Status family, with a shared core, the dock, and an installer that lets you pick, upgrade or remove widgets. This repository is archived and no longer updated; the version here is superseded.
+
 <p align="center">
   <img src="images/logo.svg?v=2" alt="ComfyUI Status Checker" width="80" />
 </p>
@@ -49,11 +51,12 @@ A lightweight, always-on-top desktop status indicator for **ComfyUI** instances.
   - Queue status changes
 - **Hover panel** — detailed breakdown:
   - Queue status (running / pending — side by side)
-  - GPU device name
-  - VRAM usage with color-coded progress bar
-  - Torch VRAM allocation
-  - System RAM usage
-  - ComfyUI version, PyTorch version, Python version
+  - **Multi-GPU** — every device ComfyUI reports gets its own section (`cuda:0`, `cuda:1`, …), labelled by device
+  - VRAM usage per device, with color-coded progress bar and percentage
+  - Torch VRAM allocation per device (omitted when the allocator doesn't expose it, e.g. `cudaMallocAsync`)
+  - **Per-GPU telemetry** — utilisation, temperature, power draw vs. limit, fan speed (compact one-line row)
+  - **CPU** — utilisation, package temperature and RAM share
+  - System RAM usage bar, plus ComfyUI / PyTorch / Python versions on one line
   - Clickable endpoint URL (click to change)
 - **Configurable endpoint** — `--host` and `--port` flags (default: `127.0.0.1:8188`)
 - **Fast polling** — HTTP every 2s + websocket for instant progress updates
@@ -189,7 +192,11 @@ The coordination works via a shared directory (`~/.config/status-widgets/`):
 | Endpoint | Data |
 |---|---|
 | `GET /queue` | Running and pending job counts — determines dot state |
-| `GET /system_stats` | GPU name, VRAM, RAM, versions |
+| `GET /system_stats` | Every GPU (name, VRAM), RAM, versions |
+
+**Local sensors** — ComfyUI's API reports VRAM but *not* temperature, power, fan or utilisation. Those are read from the machine itself every 5s: `nvidia-smi` for per-GPU telemetry, `/sys/class/hwmon` for CPU temperature, `/proc/stat` for CPU utilisation.
+
+> These rows appear **only when ComfyUI runs on the same machine as the widget**. With a remote `--host`, local sensors would describe a different machine than the VRAM above them, so they are omitted rather than shown misleadingly. Missing tools degrade the same way — no `nvidia-smi`, no GPU telemetry rows, everything else still works.
 
 **Websocket** — a persistent connection to `ws://host:port/ws` receives real-time generation progress:
 

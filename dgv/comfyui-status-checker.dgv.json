@@ -1,0 +1,1246 @@
+{
+  "dgv": 1,
+  "meta": {
+    "title": "ComfyUI Status Checker — widget architecture",
+    "description": "GTK3 always-on-top status dot for ComfyUI: HTTP polling + websocket progress, multi-widget coordination via shared config dir.",
+    "updated": "2026-08-31",
+    "colorBy": "kind",
+    "edgeStyle": "routed",
+    "driftIgnore": [
+      "README.md",
+      "LICENSE",
+      ".gitattributes",
+      "images/",
+      "dgv/",
+      "__pycache__/"
+    ]
+  },
+  "frames": [
+    {
+      "tone": "cyan",
+      "id": "widget",
+      "label": "comfyui-status-checker (GTK3 process)",
+      "note": "Single Python process, one file. Gtk.main() on the main thread + 2 daemon threads.",
+      "position": {
+        "x": 396,
+        "y": 0
+      },
+      "size": {
+        "width": 1328,
+        "height": 1370
+      }
+    },
+    {
+      "tone": "violet",
+      "id": "shared",
+      "label": "~/.config/status-widgets (shared FS)",
+      "note": "Cross-widget coordination surface. Any ShinyWidget reads/writes here.",
+      "position": {
+        "x": 1856,
+        "y": 0
+      },
+      "size": {
+        "width": 356,
+        "height": 241
+      }
+    },
+    {
+      "tone": "amber",
+      "id": "comfy",
+      "label": "ComfyUI server",
+      "note": "Verified live at 127.0.0.1:8188, ComfyUI 0.29.2, torch 2.9.1+cu128, --listen 0.0.0.0.",
+      "position": {
+        "x": 2344,
+        "y": 0
+      },
+      "size": {
+        "width": 356,
+        "height": 621
+      }
+    },
+    {
+      "tone": "green",
+      "id": "host",
+      "label": "this machine (local hardware)",
+      "note": "Only read when the monitored endpoint resolves to this machine — otherwise the panel would mix a remote server's VRAM with local sensors.",
+      "position": {
+        "x": -4,
+        "y": 1506
+      },
+      "size": {
+        "width": 356,
+        "height": 422
+      }
+    }
+  ],
+  "nodes": [
+    {
+      "ports": [],
+      "tags": [],
+      "id": "cli",
+      "kind": "program",
+      "label": "main()",
+      "sublabel": "argparse --host/--port",
+      "note": "Builds DotWindow(host, port) then Gtk.main(). No config file — endpoint only via flags or the click dialog.",
+      "frame": "widget",
+      "tech": "Python 3.8+",
+      "status": "done",
+      "path": "comfyui-status-checker.py",
+      "position": {
+        "x": 444,
+        "y": 536
+      },
+      "ack": "single-file app — every node shares comfyui-status-checker.py by design; line ranges are in each note"
+    },
+    {
+      "ports": [
+        {
+          "id": "apply",
+          "protocol": "ipc",
+          "dir": "in",
+          "shape": "GLib.idle_add(_apply_data, data dict)"
+        },
+        {
+          "id": "wsevents",
+          "protocol": "ipc",
+          "dir": "in",
+          "shape": "_on_ws_progress(step,total) / _on_ws_complete()"
+        }
+      ],
+      "tags": [],
+      "id": "dot",
+      "kind": "ui",
+      "label": "DotWindow",
+      "sublabel": "floating dot, cairo-drawn, always-on-top",
+      "note": "Owns self.data (the single state dict), self.color, drag/hover/key handling. Lines 546-1031.",
+      "frame": "widget",
+      "tech": "Gtk.Window + cairo",
+      "status": "done",
+      "path": "comfyui-status-checker.py",
+      "position": {
+        "x": 768,
+        "y": 515
+      },
+      "ack": "single-file app — shares the one module file with its sibling nodes"
+    },
+    {
+      "ports": [],
+      "tags": [],
+      "id": "poller",
+      "kind": "worker",
+      "label": "_poll_loop",
+      "sublabel": "daemon thread, every 2s",
+      "note": "_fetch() hits /queue then /system_stats and maps EVERY devices[] entry through _device_info() into data['devices'] (a list). No index is hardcoded.",
+      "frame": "widget",
+      "tech": "threading + urllib",
+      "status": "done",
+      "path": "comfyui-status-checker.py",
+      "position": {
+        "x": 1092,
+        "y": 90
+      },
+      "ack": "single-file app — shares the one module file with its sibling nodes"
+    },
+    {
+      "ports": [],
+      "tags": [],
+      "id": "ws",
+      "kind": "worker",
+      "label": "_ComfyWS",
+      "sublabel": "daemon thread, hand-rolled websocket",
+      "note": "No pip deps — implements its own frame reader (_read_frame/_recv_exact). Emits on_progress(step,total) and on_complete. Lines 174-296.",
+      "frame": "widget",
+      "tech": "raw socket + RFC6455 framing",
+      "status": "done",
+      "path": "comfyui-status-checker.py",
+      "position": {
+        "x": 1092,
+        "y": 304
+      },
+      "ack": "single-file app — shares the one module file with its sibling nodes"
+    },
+    {
+      "ports": [
+        {
+          "id": "render",
+          "protocol": "ipc",
+          "dir": "in",
+          "shape": "update_data(data, base_url)"
+        }
+      ],
+      "tags": [],
+      "id": "panel",
+      "kind": "ui",
+      "label": "PanelWindow",
+      "sublabel": "hover detail panel",
+      "note": "update_data() loops over data['devices'] and emits one section per device. Telemetry uses _add_metrics_row (several short readings per line) rather than a full-width row each — 942px → 591px for 2 GPUs. Still rebuilds its whole child tree each poll (see flag).",
+      "frame": "widget",
+      "tech": "Gtk.Window + CSS",
+      "status": "done",
+      "path": "comfyui-status-checker.py",
+      "position": {
+        "x": 1092,
+        "y": 518
+      },
+      "flags": [
+        {
+          "id": "f1",
+          "kind": "issue",
+          "title": "update_data destroys and rebuilds every widget on each 2s poll while hovering",
+          "note": "update_data (line 1191) starts with `for child in self.inner.get_children(): self.inner.remove(child)` then reconstructs every label, bar and separator, ending in show_all(). Because _apply_data calls it on every poll while the panel is visible, the whole panel is torn down and rebuilt 30x/min during hover. It works today because the tree is small (~15 widgets), but multi-GPU multiplies that per card, and rebuilding is why any future interactive control in the panel (a per-GPU expander, a selected row) cannot hold state across a poll.",
+          "fix": "Build the row widgets once in __init__ and have update_data only set label text / bar fractions. If the device count changes, rebuild just the GPU section rather than the whole panel.",
+          "by": "agent",
+          "at": "2026-08-31T19:36:49.879Z"
+        }
+      ],
+      "ack": "single-file app — shares the one module file with its sibling nodes"
+    },
+    {
+      "ports": [],
+      "tags": [],
+      "id": "toast",
+      "kind": "ui",
+      "label": "ToastWindow",
+      "sublabel": "transient notification, fades",
+      "note": "Shown on state transitions and on each ws progress step. Lines 1033-1114.",
+      "frame": "widget",
+      "tech": "Gtk.Window + cairo",
+      "status": "done",
+      "path": "comfyui-status-checker.py",
+      "position": {
+        "x": 1092,
+        "y": 773
+      },
+      "ack": "single-file app — shares the one module file with its sibling nodes"
+    },
+    {
+      "ports": [],
+      "tags": [],
+      "id": "coord",
+      "kind": "module",
+      "label": "widget coordination",
+      "sublabel": "register / corner cycle / stack",
+      "note": "_register_widget, _get_active_widgets, _read_corner/_write_corner, _watch_corner polls corner.json 5x/sec. Lines 66-132, 865-914.",
+      "frame": "widget",
+      "tech": "json + os.kill(pid,0)",
+      "status": "done",
+      "path": "comfyui-status-checker.py",
+      "position": {
+        "x": 1092,
+        "y": 957
+      },
+      "ack": "single-file app — shares the one module file with its sibling nodes"
+    },
+    {
+      "ports": [],
+      "tags": [],
+      "id": "logo",
+      "kind": "module",
+      "label": "SVG path renderer",
+      "sublabel": "mini SVG-to-cairo parser",
+      "note": "_parse_svg_path / _svg_arc_to_cairo / draw_svg_logo — draws the ComfyUI mark inside the dot. Lines 298-526.",
+      "frame": "widget",
+      "tech": "cairo",
+      "status": "done",
+      "path": "comfyui-status-checker.py",
+      "position": {
+        "x": 1092,
+        "y": 1171
+      },
+      "ack": "single-file app — shares the one module file with its sibling nodes"
+    },
+    {
+      "ports": [],
+      "tags": [],
+      "id": "registry",
+      "kind": "storage",
+      "label": "widget registry",
+      "sublabel": "<name>.json per live widget + corner.json",
+      "note": "Each file holds {pid, name}. Stale PIDs are deleted on scan. corner.json holds the shared corner_index.",
+      "frame": "shared",
+      "position": {
+        "x": 1904,
+        "y": 60
+      }
+    },
+    {
+      "ports": [
+        {
+          "id": "http",
+          "protocol": "http",
+          "dir": "in",
+          "shape": "JSON {queue_running[], queue_pending[]}"
+        }
+      ],
+      "tags": [],
+      "id": "queueapi",
+      "kind": "api",
+      "label": "GET /queue",
+      "sublabel": "running + pending job counts",
+      "frame": "comfy",
+      "tech": "ComfyUI REST",
+      "position": {
+        "x": 2392,
+        "y": 60
+      }
+    },
+    {
+      "ports": [
+        {
+          "id": "http",
+          "protocol": "http",
+          "dir": "in",
+          "shape": "JSON {system{}, devices[{name,index,vram_total,vram_free,...}]}"
+        }
+      ],
+      "tags": [],
+      "id": "statsapi",
+      "kind": "api",
+      "label": "GET /system_stats",
+      "sublabel": "system + devices[]",
+      "note": "Verified response: devices[] is a LIST — both 3090s present (cuda:0, cuda:1). The widget now consumes all of them.",
+      "frame": "comfy",
+      "tech": "ComfyUI REST",
+      "position": {
+        "x": 2392,
+        "y": 228
+      }
+    },
+    {
+      "ports": [
+        {
+          "id": "ws",
+          "protocol": "ws",
+          "dir": "both",
+          "shape": "client connects → server streams JSON {type: progress|executing, data{}}"
+        }
+      ],
+      "tags": [],
+      "id": "wsapi",
+      "kind": "api",
+      "label": "WS /ws",
+      "sublabel": "live execution events",
+      "frame": "comfy",
+      "tech": "ComfyUI websocket",
+      "position": {
+        "x": 2392,
+        "y": 453
+      }
+    },
+    {
+      "ports": [],
+      "tags": [],
+      "id": "gpus",
+      "kind": "device",
+      "label": "2x RTX 3090",
+      "sublabel": "cuda:0 + cuda:1, ~24GB each",
+      "note": "Both cards now enumerated and rendered — one panel section per device, count driven by the response.",
+      "position": {
+        "x": 0,
+        "y": 0
+      },
+      "status": "done"
+    },
+    {
+      "ports": [],
+      "tags": [],
+      "id": "sensors",
+      "kind": "module",
+      "label": "local sensor layer",
+      "sublabel": "nvidia-smi + hwmon + /proc/stat",
+      "note": "read_gpu_sensors() shells nvidia-smi (temp/util/power/limit/fan per index); _find_cpu_temp_input() probes hwmon for k10temp/zenpower/coretemp; _CpuUtil reads /proc/stat deltas. Gated by _endpoint_is_local() and throttled to SENSOR_SECS=5. Every reading degrades to None rather than raising.",
+      "frame": "widget",
+      "tech": "subprocess + sysfs",
+      "status": "done",
+      "path": "comfyui-status-checker.py",
+      "ack": "single-file app — shares the one module file with its sibling nodes",
+      "position": {
+        "x": 1416,
+        "y": 60
+      },
+      "flags": [
+        {
+          "id": "f1",
+          "kind": "idea",
+          "title": "Temp/power/fan are unavailable for remote endpoints — no rows at all when --host is another machine",
+          "note": "ComfyUI's /system_stats exposes VRAM only (verified: device keys are name/type/index/vram_total/vram_free/torch_vram_total/torch_vram_free — no temperature, power, utilisation or fan). So telemetry has to come from the machine itself, and _endpoint_is_local() gates it off whenever --host points elsewhere. Correct — showing this box's sensors beside a remote server's VRAM would silently describe two machines — but it means the README's remote/NAS use case gets VRAM only, with no hint as to why the CPU and temperature rows vanished.",
+          "fix": "If remote telemetry is wanted: either run a tiny agent on the ComfyUI host exposing nvidia-smi over HTTP, or use a ComfyUI extension that adds temps to the API (e.g. Crystools), and have the widget prefer server-provided sensor fields when present, falling back to local. Cheaper interim: render a dim \"sensors: local only\" note in the panel when the endpoint is remote.",
+          "by": "agent",
+          "at": "2026-08-31T19:49:07.732Z"
+        }
+      ]
+    },
+    {
+      "ports": [],
+      "tags": [],
+      "id": "nvsmi",
+      "kind": "program",
+      "label": "nvidia-smi",
+      "sublabel": "NVIDIA driver CLI",
+      "note": "Verified present at /usr/bin/nvidia-smi. Reports both 3090s: temp, util, power draw vs 280W limit, fan.",
+      "frame": "host",
+      "position": {
+        "x": 44,
+        "y": 1566
+      }
+    },
+    {
+      "ports": [],
+      "tags": [],
+      "id": "hwmon",
+      "kind": "storage",
+      "label": "sysfs sensors",
+      "sublabel": "/sys/class/hwmon + /proc/stat",
+      "note": "CPU package temp via k10temp (AMD, hwmon2/temp1 = Tctl) and utilisation from /proc/stat deltas.",
+      "frame": "host",
+      "position": {
+        "x": 44,
+        "y": 1747
+      }
+    }
+  ],
+  "edges": [
+    {
+      "kind": "control",
+      "id": "cli-dot",
+      "source": "cli",
+      "target": "dot",
+      "protocol": "exec",
+      "label": "constructs + Gtk.main()"
+    },
+    {
+      "kind": "control",
+      "id": "dot-poller",
+      "source": "dot",
+      "target": "poller",
+      "protocol": "ipc",
+      "label": "spawns daemon thread"
+    },
+    {
+      "kind": "control",
+      "id": "dot-ws",
+      "source": "dot",
+      "target": "ws",
+      "protocol": "ipc",
+      "label": "spawns + update_endpoint()"
+    },
+    {
+      "kind": "sync",
+      "id": "poller-queueapi",
+      "source": "poller",
+      "target": "queueapi",
+      "protocol": "http",
+      "label": "poll every 2s (5s timeout)",
+      "targetPort": "http",
+      "payload": "→ running/pending counts → dot state"
+    },
+    {
+      "kind": "sync",
+      "id": "poller-statsapi",
+      "source": "poller",
+      "target": "statsapi",
+      "protocol": "http",
+      "label": "poll every 2s (5s timeout)",
+      "targetPort": "http",
+      "payload": "→ ALL devices[] → _device_info() per card"
+    },
+    {
+      "kind": "async",
+      "id": "ws-wsapi",
+      "source": "ws",
+      "target": "wsapi",
+      "protocol": "ws",
+      "label": "persistent connect + read loop",
+      "targetPort": "ws",
+      "payload": "progress {value,max} / executing {node:null}"
+    },
+    {
+      "kind": "async",
+      "id": "poller-dot",
+      "source": "poller",
+      "target": "dot",
+      "protocol": "ipc",
+      "label": "GLib.idle_add(_apply_data)",
+      "targetPort": "apply",
+      "payload": "flat dict + devices[] list (N cards)"
+    },
+    {
+      "kind": "async",
+      "id": "ws-dot",
+      "source": "ws",
+      "target": "dot",
+      "protocol": "ipc",
+      "label": "_on_ws_progress / _on_ws_complete",
+      "payload": "step, total",
+      "targetPort": "wsevents"
+    },
+    {
+      "kind": "sync",
+      "id": "dot-panel",
+      "source": "dot",
+      "target": "panel",
+      "protocol": "ipc",
+      "label": "update_data on hover + each poll",
+      "targetPort": "render"
+    },
+    {
+      "kind": "control",
+      "id": "dot-toast",
+      "source": "dot",
+      "target": "toast",
+      "protocol": "ipc",
+      "label": "_show_toast on state change / progress"
+    },
+    {
+      "kind": "import",
+      "id": "dot-logo",
+      "source": "dot",
+      "target": "logo",
+      "protocol": "import",
+      "label": "draw_svg_logo in _on_draw"
+    },
+    {
+      "kind": "import",
+      "id": "dot-coord",
+      "source": "dot",
+      "target": "coord",
+      "protocol": "import",
+      "label": "register, cycle corner, stack"
+    },
+    {
+      "kind": "data",
+      "id": "coord-registry",
+      "source": "coord",
+      "target": "registry",
+      "protocol": "fs",
+      "label": "write own pid, scan peers, poll corner.json 5x/s"
+    },
+    {
+      "kind": "data",
+      "id": "statsapi-gpus",
+      "source": "statsapi",
+      "target": "gpus",
+      "protocol": "ipc",
+      "label": "enumerates all CUDA devices via torch"
+    },
+    {
+      "kind": "import",
+      "id": "poller-sensors",
+      "source": "poller",
+      "target": "sensors",
+      "protocol": "import",
+      "label": "_read_gpu_sensors / _read_cpu (cached 5s)"
+    },
+    {
+      "kind": "sync",
+      "id": "sensors-nvsmi",
+      "source": "sensors",
+      "target": "nvsmi",
+      "protocol": "exec",
+      "label": "--query-gpu=... --format=csv",
+      "payload": "index,temp,util,power.draw,power.limit,fan → keyed by index"
+    },
+    {
+      "kind": "data",
+      "id": "sensors-hwmon",
+      "source": "sensors",
+      "target": "hwmon",
+      "protocol": "fs",
+      "label": "read temp*_input + /proc/stat"
+    },
+    {
+      "kind": "data",
+      "id": "nvsmi-gpus",
+      "source": "nvsmi",
+      "target": "gpus",
+      "protocol": "ipc",
+      "label": "queries driver for per-card telemetry"
+    }
+  ],
+  "history": [
+    {
+      "at": "2026-08-31T19:36:18.092Z",
+      "by": "agent",
+      "type": "frame",
+      "id": "widget",
+      "op": "add",
+      "label": "comfyui-status-checker (GTK3 process)"
+    },
+    {
+      "at": "2026-08-31T19:36:18.092Z",
+      "by": "agent",
+      "type": "frame",
+      "id": "shared",
+      "op": "add",
+      "label": "~/.config/status-widgets (shared FS)"
+    },
+    {
+      "at": "2026-08-31T19:36:18.092Z",
+      "by": "agent",
+      "type": "frame",
+      "id": "comfy",
+      "op": "add",
+      "label": "ComfyUI server"
+    },
+    {
+      "at": "2026-08-31T19:36:18.092Z",
+      "by": "agent",
+      "type": "node",
+      "id": "cli",
+      "op": "add",
+      "kind": "program",
+      "label": "main()"
+    },
+    {
+      "at": "2026-08-31T19:36:18.092Z",
+      "by": "agent",
+      "type": "node",
+      "id": "dot",
+      "op": "add",
+      "kind": "ui",
+      "label": "DotWindow"
+    },
+    {
+      "at": "2026-08-31T19:36:18.092Z",
+      "by": "agent",
+      "type": "node",
+      "id": "poller",
+      "op": "add",
+      "kind": "worker",
+      "label": "_poll_loop"
+    },
+    {
+      "at": "2026-08-31T19:36:18.092Z",
+      "by": "agent",
+      "type": "node",
+      "id": "ws",
+      "op": "add",
+      "kind": "worker",
+      "label": "_ComfyWS"
+    },
+    {
+      "at": "2026-08-31T19:36:18.092Z",
+      "by": "agent",
+      "type": "node",
+      "id": "panel",
+      "op": "add",
+      "kind": "ui",
+      "label": "PanelWindow"
+    },
+    {
+      "at": "2026-08-31T19:36:18.092Z",
+      "by": "agent",
+      "type": "node",
+      "id": "toast",
+      "op": "add",
+      "kind": "ui",
+      "label": "ToastWindow"
+    },
+    {
+      "at": "2026-08-31T19:36:18.092Z",
+      "by": "agent",
+      "type": "node",
+      "id": "coord",
+      "op": "add",
+      "kind": "module",
+      "label": "widget coordination"
+    },
+    {
+      "at": "2026-08-31T19:36:18.092Z",
+      "by": "agent",
+      "type": "node",
+      "id": "logo",
+      "op": "add",
+      "kind": "module",
+      "label": "SVG path renderer"
+    },
+    {
+      "at": "2026-08-31T19:36:18.092Z",
+      "by": "agent",
+      "type": "node",
+      "id": "registry",
+      "op": "add",
+      "kind": "storage",
+      "label": "widget registry"
+    },
+    {
+      "at": "2026-08-31T19:36:18.092Z",
+      "by": "agent",
+      "type": "node",
+      "id": "queueapi",
+      "op": "add",
+      "kind": "api",
+      "label": "GET /queue"
+    },
+    {
+      "at": "2026-08-31T19:36:18.092Z",
+      "by": "agent",
+      "type": "node",
+      "id": "statsapi",
+      "op": "add",
+      "kind": "api",
+      "label": "GET /system_stats"
+    },
+    {
+      "at": "2026-08-31T19:36:18.092Z",
+      "by": "agent",
+      "type": "node",
+      "id": "wsapi",
+      "op": "add",
+      "kind": "api",
+      "label": "WS /ws"
+    },
+    {
+      "at": "2026-08-31T19:36:18.092Z",
+      "by": "agent",
+      "type": "node",
+      "id": "gpus",
+      "op": "add",
+      "kind": "device",
+      "label": "2x RTX 3090"
+    },
+    {
+      "at": "2026-08-31T19:36:18.092Z",
+      "by": "agent",
+      "type": "edge",
+      "id": "cli-dot",
+      "op": "add",
+      "kind": "control",
+      "label": "cli → dot"
+    },
+    {
+      "at": "2026-08-31T19:36:18.092Z",
+      "by": "agent",
+      "type": "edge",
+      "id": "dot-poller",
+      "op": "add",
+      "kind": "control",
+      "label": "dot → poller"
+    },
+    {
+      "at": "2026-08-31T19:36:18.092Z",
+      "by": "agent",
+      "type": "edge",
+      "id": "dot-ws",
+      "op": "add",
+      "kind": "control",
+      "label": "dot → ws"
+    },
+    {
+      "at": "2026-08-31T19:36:18.092Z",
+      "by": "agent",
+      "type": "edge",
+      "id": "poller-queueapi",
+      "op": "add",
+      "kind": "sync",
+      "label": "poller → queueapi"
+    },
+    {
+      "at": "2026-08-31T19:36:18.092Z",
+      "by": "agent",
+      "type": "edge",
+      "id": "poller-statsapi",
+      "op": "add",
+      "kind": "sync",
+      "label": "poller → statsapi"
+    },
+    {
+      "at": "2026-08-31T19:36:18.092Z",
+      "by": "agent",
+      "type": "edge",
+      "id": "ws-wsapi",
+      "op": "add",
+      "kind": "async",
+      "label": "ws → wsapi"
+    },
+    {
+      "at": "2026-08-31T19:36:18.092Z",
+      "by": "agent",
+      "type": "edge",
+      "id": "poller-dot",
+      "op": "add",
+      "kind": "async",
+      "label": "poller → dot"
+    },
+    {
+      "at": "2026-08-31T19:36:18.092Z",
+      "by": "agent",
+      "type": "edge",
+      "id": "ws-dot",
+      "op": "add",
+      "kind": "async",
+      "label": "ws → dot"
+    },
+    {
+      "at": "2026-08-31T19:36:18.092Z",
+      "by": "agent",
+      "type": "edge",
+      "id": "dot-panel",
+      "op": "add",
+      "kind": "sync",
+      "label": "dot → panel"
+    },
+    {
+      "at": "2026-08-31T19:36:18.092Z",
+      "by": "agent",
+      "type": "edge",
+      "id": "dot-toast",
+      "op": "add",
+      "kind": "control",
+      "label": "dot → toast"
+    },
+    {
+      "at": "2026-08-31T19:36:18.092Z",
+      "by": "agent",
+      "type": "edge",
+      "id": "dot-logo",
+      "op": "add",
+      "kind": "import",
+      "label": "dot → logo"
+    },
+    {
+      "at": "2026-08-31T19:36:18.092Z",
+      "by": "agent",
+      "type": "edge",
+      "id": "dot-coord",
+      "op": "add",
+      "kind": "import",
+      "label": "dot → coord"
+    },
+    {
+      "at": "2026-08-31T19:36:18.092Z",
+      "by": "agent",
+      "type": "edge",
+      "id": "coord-registry",
+      "op": "add",
+      "kind": "data",
+      "label": "coord → registry"
+    },
+    {
+      "at": "2026-08-31T19:36:18.092Z",
+      "by": "agent",
+      "type": "edge",
+      "id": "statsapi-gpus",
+      "op": "add",
+      "kind": "data",
+      "label": "statsapi → gpus"
+    },
+    {
+      "at": "2026-08-31T19:36:18.092Z",
+      "by": "agent",
+      "type": "meta",
+      "id": "meta",
+      "op": "change",
+      "fields": [
+        {
+          "field": "driftIgnore",
+          "to": "README.md, LICENSE, .gitattributes, images/, dgv/"
+        }
+      ]
+    },
+    {
+      "at": "2026-08-31T19:36:25.203Z",
+      "by": "agent",
+      "type": "node",
+      "id": "dot",
+      "op": "change",
+      "fields": [
+        {
+          "field": "ports",
+          "from": "apply:ipc/in",
+          "to": "apply:ipc/in, wsevents:ipc/in"
+        }
+      ]
+    },
+    {
+      "at": "2026-08-31T19:36:25.203Z",
+      "by": "agent",
+      "type": "node",
+      "id": "wsapi",
+      "op": "change",
+      "fields": [
+        {
+          "field": "ports",
+          "from": "ws:ws/out",
+          "to": "ws:ws/both"
+        }
+      ]
+    },
+    {
+      "at": "2026-08-31T19:36:25.203Z",
+      "by": "agent",
+      "type": "edge",
+      "id": "ws-dot",
+      "op": "change",
+      "fields": [
+        {
+          "field": "targetPort",
+          "to": "wsevents"
+        }
+      ]
+    },
+    {
+      "at": "2026-08-31T19:36:35.481Z",
+      "by": "agent",
+      "type": "edge",
+      "id": "poller-statsapi",
+      "op": "flag",
+      "flag": {
+        "id": "f1",
+        "kind": "issue",
+        "title": "devices[0] hardcoded — every GPU past the first is silently discarded"
+      }
+    },
+    {
+      "at": "2026-08-31T19:36:49.879Z",
+      "by": "agent",
+      "type": "node",
+      "id": "panel",
+      "op": "flag",
+      "flag": {
+        "id": "f1",
+        "kind": "issue",
+        "title": "update_data destroys and rebuilds every widget on each 2s poll while hovering"
+      }
+    },
+    {
+      "at": "2026-08-31T19:36:58.502Z",
+      "by": "agent",
+      "type": "node",
+      "id": "statsapi",
+      "op": "flag",
+      "flag": {
+        "id": "f1",
+        "kind": "question",
+        "title": "torch_vram_total/free are 0 on this server — the Torch VRAM bar never renders"
+      }
+    },
+    {
+      "at": "2026-08-31T19:42:36.652Z",
+      "by": "agent",
+      "type": "node",
+      "id": "poller",
+      "op": "change",
+      "fields": [
+        {
+          "field": "note",
+          "from": "_fetch() hits /queue then /system_stats, builds a flat data dict, hands it to…",
+          "to": "_fetch() hits /queue then /system_stats and maps EVERY devices[] entry throug…"
+        }
+      ]
+    },
+    {
+      "at": "2026-08-31T19:42:36.652Z",
+      "by": "agent",
+      "type": "node",
+      "id": "panel",
+      "op": "change",
+      "fields": [
+        {
+          "field": "note",
+          "from": "update_data() tears down and rebuilds every child on each poll. Renders GPU/V…",
+          "to": "update_data() loops over data['devices'] and emits one section per device; he…"
+        }
+      ]
+    },
+    {
+      "at": "2026-08-31T19:42:36.652Z",
+      "by": "agent",
+      "type": "node",
+      "id": "statsapi",
+      "op": "change",
+      "fields": [
+        {
+          "field": "note",
+          "from": "Verified response: devices[] is a LIST — both 3090s present (cuda:0, cuda:1),…",
+          "to": "Verified response: devices[] is a LIST — both 3090s present (cuda:0, cuda:1).…"
+        }
+      ]
+    },
+    {
+      "at": "2026-08-31T19:42:36.652Z",
+      "by": "agent",
+      "type": "node",
+      "id": "gpus",
+      "op": "change",
+      "fields": [
+        {
+          "field": "note",
+          "from": "Physically present and both reported by ComfyUI. The widget currently surface…",
+          "to": "Both cards now enumerated and rendered — one panel section per device, count …"
+        },
+        {
+          "field": "status",
+          "to": "done"
+        }
+      ]
+    },
+    {
+      "at": "2026-08-31T19:42:36.652Z",
+      "by": "agent",
+      "type": "edge",
+      "id": "poller-statsapi",
+      "op": "change",
+      "fields": [
+        {
+          "field": "payload",
+          "from": "→ devices[0] ONLY, rest discarded",
+          "to": "→ ALL devices[] → _device_info() per card"
+        }
+      ]
+    },
+    {
+      "at": "2026-08-31T19:42:36.652Z",
+      "by": "agent",
+      "type": "edge",
+      "id": "poller-dot",
+      "op": "change",
+      "fields": [
+        {
+          "field": "payload",
+          "from": "flat data dict (single-GPU shaped)",
+          "to": "flat dict + devices[] list (N cards)"
+        }
+      ]
+    },
+    {
+      "at": "2026-08-31T19:42:44.640Z",
+      "by": "agent",
+      "type": "edge",
+      "id": "poller-statsapi",
+      "op": "resolve",
+      "flag": {
+        "id": "f1",
+        "kind": "issue",
+        "title": "devices[0] hardcoded — every GPU past the first is silently discarded"
+      }
+    },
+    {
+      "at": "2026-08-31T19:42:49.184Z",
+      "by": "agent",
+      "type": "node",
+      "id": "statsapi",
+      "op": "resolve",
+      "flag": {
+        "id": "f1",
+        "kind": "question",
+        "title": "torch_vram_total/free are 0 on this server — the Torch VRAM bar never renders"
+      }
+    },
+    {
+      "at": "2026-08-31T19:43:05.846Z",
+      "by": "agent",
+      "type": "node",
+      "id": "cli",
+      "op": "change",
+      "fields": [
+        {
+          "field": "ack",
+          "to": "single-file app — every node shares comfyui-status-checker.py by design; line…"
+        }
+      ]
+    },
+    {
+      "at": "2026-08-31T19:43:05.846Z",
+      "by": "agent",
+      "type": "node",
+      "id": "dot",
+      "op": "change",
+      "fields": [
+        {
+          "field": "ack",
+          "to": "single-file app — shares the one module file with its sibling nodes"
+        }
+      ]
+    },
+    {
+      "at": "2026-08-31T19:43:05.846Z",
+      "by": "agent",
+      "type": "node",
+      "id": "poller",
+      "op": "change",
+      "fields": [
+        {
+          "field": "ack",
+          "to": "single-file app — shares the one module file with its sibling nodes"
+        }
+      ]
+    },
+    {
+      "at": "2026-08-31T19:43:05.846Z",
+      "by": "agent",
+      "type": "node",
+      "id": "ws",
+      "op": "change",
+      "fields": [
+        {
+          "field": "ack",
+          "to": "single-file app — shares the one module file with its sibling nodes"
+        }
+      ]
+    },
+    {
+      "at": "2026-08-31T19:43:05.846Z",
+      "by": "agent",
+      "type": "node",
+      "id": "panel",
+      "op": "change",
+      "fields": [
+        {
+          "field": "ack",
+          "to": "single-file app — shares the one module file with its sibling nodes"
+        }
+      ]
+    },
+    {
+      "at": "2026-08-31T19:43:05.846Z",
+      "by": "agent",
+      "type": "node",
+      "id": "toast",
+      "op": "change",
+      "fields": [
+        {
+          "field": "ack",
+          "to": "single-file app — shares the one module file with its sibling nodes"
+        }
+      ]
+    },
+    {
+      "at": "2026-08-31T19:43:05.846Z",
+      "by": "agent",
+      "type": "node",
+      "id": "coord",
+      "op": "change",
+      "fields": [
+        {
+          "field": "ack",
+          "to": "single-file app — shares the one module file with its sibling nodes"
+        }
+      ]
+    },
+    {
+      "at": "2026-08-31T19:43:05.846Z",
+      "by": "agent",
+      "type": "node",
+      "id": "logo",
+      "op": "change",
+      "fields": [
+        {
+          "field": "ack",
+          "to": "single-file app — shares the one module file with its sibling nodes"
+        }
+      ]
+    },
+    {
+      "at": "2026-08-31T19:43:05.846Z",
+      "by": "agent",
+      "type": "meta",
+      "id": "meta",
+      "op": "change",
+      "fields": [
+        {
+          "field": "driftIgnore",
+          "from": "README.md, LICENSE, .gitattributes, images/, dgv/",
+          "to": "README.md, LICENSE, .gitattributes, images/, dgv/, __pycache__/"
+        }
+      ]
+    },
+    {
+      "at": "2026-08-31T19:48:56.946Z",
+      "by": "agent",
+      "type": "frame",
+      "id": "host",
+      "op": "add",
+      "label": "this machine (local hardware)"
+    },
+    {
+      "at": "2026-08-31T19:48:56.946Z",
+      "by": "agent",
+      "type": "node",
+      "id": "sensors",
+      "op": "add",
+      "kind": "module",
+      "label": "local sensor layer"
+    },
+    {
+      "at": "2026-08-31T19:48:56.946Z",
+      "by": "agent",
+      "type": "node",
+      "id": "nvsmi",
+      "op": "add",
+      "kind": "program",
+      "label": "nvidia-smi"
+    },
+    {
+      "at": "2026-08-31T19:48:56.946Z",
+      "by": "agent",
+      "type": "node",
+      "id": "hwmon",
+      "op": "add",
+      "kind": "storage",
+      "label": "sysfs sensors"
+    },
+    {
+      "at": "2026-08-31T19:48:56.946Z",
+      "by": "agent",
+      "type": "edge",
+      "id": "poller-sensors",
+      "op": "add",
+      "kind": "import",
+      "label": "poller → sensors"
+    },
+    {
+      "at": "2026-08-31T19:48:56.946Z",
+      "by": "agent",
+      "type": "edge",
+      "id": "sensors-nvsmi",
+      "op": "add",
+      "kind": "sync",
+      "label": "sensors → nvsmi"
+    },
+    {
+      "at": "2026-08-31T19:48:56.946Z",
+      "by": "agent",
+      "type": "edge",
+      "id": "sensors-hwmon",
+      "op": "add",
+      "kind": "data",
+      "label": "sensors → hwmon"
+    },
+    {
+      "at": "2026-08-31T19:48:56.946Z",
+      "by": "agent",
+      "type": "edge",
+      "id": "nvsmi-gpus",
+      "op": "add",
+      "kind": "data",
+      "label": "nvsmi → gpus"
+    },
+    {
+      "at": "2026-08-31T19:49:07.733Z",
+      "by": "agent",
+      "type": "node",
+      "id": "sensors",
+      "op": "flag",
+      "flag": {
+        "id": "f1",
+        "kind": "idea",
+        "title": "Temp/power/fan are unavailable for remote endpoints — no rows at all when --host is another machine"
+      }
+    },
+    {
+      "at": "2026-08-31T20:06:35.911Z",
+      "by": "agent",
+      "type": "node",
+      "id": "panel",
+      "op": "change",
+      "fields": [
+        {
+          "field": "note",
+          "from": "update_data() loops over data['devices'] and emits one section per device; he…",
+          "to": "update_data() loops over data['devices'] and emits one section per device. Te…"
+        }
+      ]
+    }
+  ]
+}
